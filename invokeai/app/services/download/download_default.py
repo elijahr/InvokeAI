@@ -58,6 +58,20 @@ class DownloadQueueService(DownloadQueueServiceBase):
         :param requests_session: Optional requests.sessions.Session object, for unit tests.
         """
         self._app_config = app_config or get_config()
+        
+        # Debug: Log remote API tokens configuration at startup
+        if self._app_config.remote_api_tokens:
+            self._logger.info("🔑 Remote API tokens configured:")
+            for pair in self._app_config.remote_api_tokens:
+                masked = f"{pair.token[:4]}...{pair.token[-4:]}" if len(pair.token) > 8 else "****"
+                self._logger.info(f"   • Pattern: '{pair.url_regex}' → Token: {masked}")
+        else:
+            self._logger.warning("⚠️  No remote API tokens configured - downloads may fail for protected resources")
+            self._logger.info("💡 Add tokens to your invokeai.yaml:")
+            self._logger.info("   remote_api_tokens:")
+            self._logger.info("     - url_regex: '.*\\.civitai\\.com'")
+            self._logger.info("       token: 'your_civitai_api_key_here'")
+        
         self._jobs: Dict[int, DownloadJob] = {}
         self._download_part2parent: Dict[AnyHttpUrl, MultiFileDownloadJob] = {}
         self._next_job_id = 0
@@ -143,12 +157,20 @@ class DownloadQueueService(DownloadQueueServiceBase):
             raise ServiceInactiveException(
                 "The download service is not currently accepting requests. Please call start() to initialize the service."
             )
+        token = access_token or self._lookup_access_token(source)
         job = DownloadJob(
             source=source,
             dest=dest,
             priority=priority,
-            access_token=access_token or self._lookup_access_token(source),
+            access_token=token,
         )
+        
+        # Debug: Log single download token assignment
+        if token:
+            masked = f"{token[:4]}...{token[-4:]}" if len(token) > 8 else "****"
+            self._logger.info(f"🔐 Single download configured with token {masked} for {str(source)[:80]}...")
+        else:
+            self._logger.warning(f"⚠️  Single download WITHOUT token for {str(source)[:80]}...")
         self.submit_download_job(
             job,
             on_start=on_start,
@@ -184,11 +206,20 @@ class DownloadQueueService(DownloadQueueServiceBase):
             url = part.url
             path = dest / part.path
             assert path.is_relative_to(dest), "only relative download paths accepted"
+            token = access_token or self._lookup_access_token(url)
             job = DownloadJob(
                 source=url,
                 dest=path,
-                access_token=access_token or self._lookup_access_token(url),
+                access_token=token,
             )
+            
+            # Debug: Log token assignment
+            if token:
+                masked = f"{token[:4]}...{token[-4:]}" if len(token) > 8 else "****"
+                self._logger.debug(f"✅ Assigned token {masked} to job for {str(url)[:80]}...")
+            else:
+                self._logger.debug(f"⚠️  No token assigned to job for {str(url)[:80]}...")
+            
             mfdj.download_parts.add(job)
             self._download_part2parent[job.source] = mfdj
         if submit_job:
@@ -309,11 +340,38 @@ class DownloadQueueService(DownloadQueueServiceBase):
         url = job.source
         header = {"Authorization": f"Bearer {job.access_token}"} if job.access_token else {}
         open_mode = "wb"
+        
+        # Debug: Log authentication status
+        if job.access_token:
+            masked_token = f"{job.access_token[:4]}...{job.access_token[-4:]}" if len(job.access_token) > 8 else "****"
+            self._logger.debug(f"🔐 Downloading with Bearer token: {masked_token}")
+            self._logger.debug(f"   Full header: Authorization: Bearer {masked_token}")
+        else:
+            self._logger.debug(f"🔓 Downloading WITHOUT authentication token")
+            self._logger.warning(f"⚠️  No token for URL: {str(url)[:100]}...")
 
         # Make a streaming request. This will retrieve headers including
         # content-length and content-disposition, but not fetch any content itself
+        self._logger.debug(f"📥 Initiating download request to: {str(url)[:100]}...")
         resp = self._requests.get(str(url), headers=header, stream=True)
+        
+        # Debug: Log response status
+        self._logger.debug(f"📡 Response status: {resp.status_code} - {resp.reason}")
+        
         if not resp.ok:
+            self._logger.error(f"❌ Download failed: {resp.status_code} - {resp.reason}")
+            if resp.status_code == 401:
+                self._logger.error("🚫 Authentication failed - check your API token")
+                self._logger.error(f"   URL: {str(url)[:100]}...")
+                self._logger.error(f"   Had token: {'Yes' if job.access_token else 'No'}")
+                if not job.access_token and 'civitai.com' in str(url).lower():
+                    self._logger.error("   💡 TIP: Add Civitai API token to invokeai.yaml")
+            elif resp.status_code == 403:
+                self._logger.error("🚫 Access forbidden - token may lack permissions")
+            elif resp.status_code == 404:
+                self._logger.error("🚫 Resource not found - model may be deleted")
+            elif resp.status_code == 410:
+                self._logger.error("🚫 Resource gone - model permanently removed")
             raise HTTPError(resp.reason)
 
         job.content_type = resp.headers.get("Content-Type")
@@ -408,10 +466,36 @@ class DownloadQueueService(DownloadQueueServiceBase):
     def _lookup_access_token(self, source: AnyHttpUrl) -> Optional[str]:
         # Pull the token from config if it exists and matches the URL
         token = None
+        url_str = str(source)
+        
+        # Debug: Log the URL we're checking
+        self._logger.debug(f"🔍 Looking up access token for URL: {url_str}")
+        
+        # Debug: Log available token patterns
+        if self._app_config.remote_api_tokens:
+            self._logger.debug(f"📋 Available token patterns: {[pair.url_regex for pair in self._app_config.remote_api_tokens]}")
+        else:
+            self._logger.debug("⚠️  No remote_api_tokens configured in app config")
+        
         for pair in self._app_config.remote_api_tokens or []:
-            if re.search(pair.url_regex, str(source)):
-                token = pair.token
-                break
+            self._logger.debug(f"   Testing regex '{pair.url_regex}' against URL...")
+            try:
+                if re.search(pair.url_regex, url_str):
+                    token = pair.token
+                    # Mask the token for security but show first/last chars
+                    masked_token = f"{token[:4]}...{token[-4:]}" if len(token) > 8 else "****"
+                    self._logger.debug(f"   ✅ MATCH! Using token: {masked_token}")
+                    break
+                else:
+                    self._logger.debug(f"   ❌ No match for pattern '{pair.url_regex}'")
+            except re.error as e:
+                self._logger.error(f"   ⚠️  Invalid regex pattern '{pair.url_regex}': {e}")
+        
+        if token:
+            self._logger.info(f"🔐 Access token found for {url_str[:50]}...")
+        else:
+            self._logger.debug(f"🔓 No access token found for {url_str[:50]}...")
+        
         return token
 
     def _signal_job_started(self, job: DownloadJob) -> None:

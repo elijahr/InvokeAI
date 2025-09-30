@@ -58,8 +58,17 @@ class DownloadQueueService(DownloadQueueServiceBase):
         :param requests_session: Optional requests.sessions.Session object, for unit tests.
         """
         self._app_config = app_config or get_config()
+        self._jobs: Dict[int, DownloadJob] = {}
+        self._download_part2parent: Dict[AnyHttpUrl, MultiFileDownloadJob] = {}
+        self._next_job_id = 0
+        self._queue: PriorityQueue[DownloadJob] = PriorityQueue()
+        self._stop_event = threading.Event()
+        self._job_terminated_event = threading.Event()
+        self._worker_pool: Set[threading.Thread] = set()
+        self._lock = threading.Lock()
+        self._logger = InvokeAILogger.get_logger("DownloadQueueService")
         
-        # Debug: Log remote API tokens configuration at startup
+        # Debug: Log remote API tokens configuration at startup (after logger is initialized)
         if self._app_config.remote_api_tokens:
             self._logger.info("🔑 Remote API tokens configured:")
             for pair in self._app_config.remote_api_tokens:
@@ -71,16 +80,6 @@ class DownloadQueueService(DownloadQueueServiceBase):
             self._logger.info("   remote_api_tokens:")
             self._logger.info("     - url_regex: '.*\\.civitai\\.com'")
             self._logger.info("       token: 'your_civitai_api_key_here'")
-        
-        self._jobs: Dict[int, DownloadJob] = {}
-        self._download_part2parent: Dict[AnyHttpUrl, MultiFileDownloadJob] = {}
-        self._next_job_id = 0
-        self._queue: PriorityQueue[DownloadJob] = PriorityQueue()
-        self._stop_event = threading.Event()
-        self._job_terminated_event = threading.Event()
-        self._worker_pool: Set[threading.Thread] = set()
-        self._lock = threading.Lock()
-        self._logger = InvokeAILogger.get_logger("DownloadQueueService")
         self._event_bus = event_bus
         self._requests = requests_session or requests.Session()
         self._accept_download_requests = False
